@@ -307,3 +307,20 @@ test('専用セットアップは対象スプレッドシートの編集トリ�
   assert.equal(createdTriggers[0].handler, 'handleChikemoPurchaseFormEdit');
   assert.equal(createdTriggers[0].spreadsheet, spreadsheet);
 });
+
+test('購入フォーム専用clasp設定が本番プロジェクトを参照する', () => {
+  const config = JSON.parse(
+    fs.readFileSync(path.resolve('.clasp.chikemo-purchase.json'), 'utf8'),
+  );
+  assert.equal(
+    config.scriptId,
+    '1D8gGYjvfinrWlm3wGXVNLIewoEVFX3Hs06Z0PRRrzmgunBQAw5WKzIKU',
+  );
+});
+
+test('Resend送信はChikemoの安定運用どおりメールAPIだけを使用する', () => {
+  const source = fs.readFileSync(sourcePath, 'utf8');
+  assert.match(source, /https:\/\/api\.resend\.com\/emails/);
+  assert.doesNotMatch(source, /https:\/\/api\.resend\.com\/domains/);
+  assert.doesNotMatch(source, /re_[A-Za-z0-9]{10,}/);
+});

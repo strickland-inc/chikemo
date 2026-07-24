@@ -1,6 +1,3 @@
-// Chikemo_購入フォーム（Webサイト経由とは別シート）専用。
-// U列の入金を「OK」にした時だけ、入金完了メールを送る。
-
 var CHIKEMO_PURCHASE_FORM = {
   spreadsheetId: '1Pf2GPmzRdf32QlhX-OutkTD_fdkWcDfjVhOluNZy_0Q',
   sheetName: 'シート1',
@@ -9,19 +6,20 @@ var CHIKEMO_PURCHASE_FORM = {
   subject: '【チケモ】追跡番号のお知らせ',
   firstDataRow: 3,
   columns: {
-    quantity: 8,       // H
-    name: 9,           // I
-    email: 11,         // K
-    deliveryName: 13,  // M
+    quantity: 8,         // H
+    name: 9,             // I
+    email: 11,           // K
+    deliveryName: 13,    // M
     deliveryAddress: 14, // N
-    payment: 21,       // U
-    tracking: 23,      // W
-    sendResult: 30,    // AD
-    sendMessage: 31,   // AE
-    paymentDate: 32,   // AF
+    payment: 21,         // U
+    tracking: 23,        // W
+    sendResult: 30,      // AD
+    sendMessage: 31,     // AE
+    paymentDate: 32,     // AF
   },
 };
 
+// インストール型編集トリガー専用。simple trigger化を避けるため onEdit と命名しない。
 function handleChikemoPurchaseFormEdit(e) {
   if (!e || !e.range) return;
 
@@ -33,8 +31,10 @@ function handleChikemoPurchaseFormEdit(e) {
   if (range.getColumn() !== CHIKEMO_PURCHASE_FORM.columns.payment) return;
 
   var value = String(range.getValue()).trim();
-  if (value !== 'OK') return; // NGでは何も送らない
+  var paymentValuesToSend = ['OK', 'OK【トット】', 'OK【モット】'];
+  if (paymentValuesToSend.indexOf(value) === -1) return; // 「完了」やNGでは送らない
 
+  // 複数行貼り付けは先頭行だけ処理し、残りは誤送信防止のため警告する。
   if (range.getNumRows() > 1) {
     for (var row = range.getRow() + 1; row <= range.getLastRow(); row++) {
       setChikemoPurchaseFormError_(
@@ -85,9 +85,9 @@ function sendChikemoPurchaseFormPaymentEmail_(sheet, row) {
       replyTo: CHIKEMO_PURCHASE_FORM.senderEmail,
     });
   } catch (gmailError) {
-    if (typeof isQuotaError_ === 'function' && isQuotaError_(gmailError)) {
+    if (isChikemoPurchaseFormQuotaError_(gmailError)) {
       try {
-        sendViaResend_(data.email, CHIKEMO_PURCHASE_FORM.subject, body);
+        sendChikemoPurchaseFormViaResend_(data.email, CHIKEMO_PURCHASE_FORM.subject, body);
       } catch (resendError) {
         setChikemoPurchaseFormError_(sheet, row, 'Resend fallback失敗: ' + String(resendError));
         return;
@@ -146,7 +146,38 @@ function assertChikemoPurchaseFormSender_() {
   }
 }
 
-// Apps Scriptエディタから、chikemo.info@chikemo.net で1回だけ実行する。
+function isChikemoPurchaseFormQuotaError_(error) {
+  var message = String(error).toLowerCase();
+  return message.indexOf('limit') !== -1 ||
+    message.indexOf('quota') !== -1 ||
+    message.indexOf('too many') !== -1;
+}
+
+function sendChikemoPurchaseFormViaResend_(to, subject, body) {
+  var apiKey = PropertiesService.getScriptProperties().getProperty('RESEND_API_KEY');
+  if (!apiKey) throw new Error('RESEND_API_KEY が未設定');
+
+  var response = UrlFetchApp.fetch('https://api.resend.com/emails', {
+    method: 'post',
+    contentType: 'application/json',
+    headers: { Authorization: 'Bearer ' + apiKey },
+    payload: JSON.stringify({
+      from: CHIKEMO_PURCHASE_FORM.senderName + ' <' + CHIKEMO_PURCHASE_FORM.senderEmail + '>',
+      to: [to],
+      subject: subject,
+      text: body,
+      reply_to: CHIKEMO_PURCHASE_FORM.senderEmail,
+    }),
+    muteHttpExceptions: true,
+  });
+
+  var status = response.getResponseCode();
+  if (status < 200 || status >= 300) {
+    throw new Error('Resend API error ' + status + ': ' + response.getContentText());
+  }
+}
+
+// Apps Scriptエディタから chikemo.info@chikemo.net で1回だけ実行する。
 function setupChikemoPurchaseFormAutomation() {
   assertChikemoPurchaseFormSender_();
 
@@ -190,4 +221,65 @@ function verifyChikemoPurchaseFormHeaders_(sheet) {
       throw new Error(item[0] + 'のヘッダーが予想と異なります。期待: ' + item[1] + ' / 実際: ' + actual);
     }
   });
+}
+
+// Resend設定確認用。管理アドレスにテストメールを1通送る。
+function testChikemoResendConfiguration() {
+  sendChikemoPurchaseFormViaResend_(
+    'i7811832616@gmail.com',
+    '【テスト】Chikemo Resend設定確認',
+    'このメールはChikemo購入フォームのResend設定確認です。受信できていれば正常です。'
+  );
+  console.log('Resendテスト送信成功');
+}
+
+// 8466行目のテストデータだけをResend経由で送信する。
+function sendTestRow8466ViaResend() {
+  var row = 8466;
+  var spreadsheet = SpreadsheetApp.openById(CHIKEMO_PURCHASE_FORM.spreadsheetId);
+  var sheet = spreadsheet.getSheetByName(CHIKEMO_PURCHASE_FORM.sheetName);
+  if (!sheet) throw new Error('対象シートが見つかりません');
+
+  var columns = CHIKEMO_PURCHASE_FORM.columns;
+  if (getChikemoPurchaseFormCell_(sheet, row, columns.sendResult) === '送信済み') {
+    throw new Error('8466行目は送信済みです');
+  }
+
+  var data = {
+    quantity: getChikemoPurchaseFormCell_(sheet, row, columns.quantity),
+    name: getChikemoPurchaseFormCell_(sheet, row, columns.name),
+    email: getChikemoPurchaseFormCell_(sheet, row, columns.email),
+    deliveryName: getChikemoPurchaseFormCell_(sheet, row, columns.deliveryName),
+    deliveryAddress: getChikemoPurchaseFormCell_(sheet, row, columns.deliveryAddress),
+    tracking: getChikemoPurchaseFormCell_(sheet, row, columns.tracking),
+  };
+
+  var required = [
+    ['メールアドレス', data.email],
+    ['お名前', data.name],
+    ['購入枚数', data.quantity],
+    ['送付先名', data.deliveryName],
+    ['送付先住所', data.deliveryAddress],
+    ['追跡番号', data.tracking],
+  ];
+  for (var i = 0; i < required.length; i++) {
+    if (!required[i][1]) throw new Error(required[i][0] + 'が空');
+  }
+
+  try {
+    sendChikemoPurchaseFormViaResend_(
+      data.email,
+      CHIKEMO_PURCHASE_FORM.subject,
+      buildChikemoPurchaseFormBody_(data)
+    );
+    sheet.getRange(row, columns.sendResult).setValue('送信済み');
+    sheet.getRange(row, columns.sendMessage).setValue('');
+    sheet.getRange(row, columns.paymentDate).setValue(
+      Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy/MM/dd HH:mm:ss')
+    );
+    console.log('8466行目のResend送信成功');
+  } catch (error) {
+    setChikemoPurchaseFormError_(sheet, row, 'Resendテスト失敗: ' + String(error));
+    throw error;
+  }
 }
