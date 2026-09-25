@@ -159,34 +159,28 @@ function sendCancellationNotification_(sheet, row, headers) {
 
 // ===== メール送信 & ステータス記録 =====
 function sendEmail_(sheet, row, headers, type, to, subject, body) {
+  // 送信と記録を同じ try に入れない。送信後の書き込みが「too many」等で失敗すると
+  // クォータ切れと誤判定し、Gmail で届いたメールを Resend でもう一度送ってしまうため。
   try {
     GmailApp.sendEmail(to, subject, body, {
       name: CONFIG.senderName,
       replyTo: CONFIG.contactEmail,
     });
-    setCell_(sheet, row, headers, type + '済み', '送信済み');
-    SpreadsheetApp.flush();
-    setCell_(sheet, row, headers, type + '日時', Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy/MM/dd HH:mm:ss'));
-    setCell_(sheet, row, headers, type + 'エラー', '');
   } catch (gmailErr) {
-    if (isQuotaError_(gmailErr)) {
-      try {
-        sendViaResend_(to, subject, body, computeChikemoMainIdempotencyKey_(type, to, subject, body));
-        setCell_(sheet, row, headers, type + '済み', '送信済み');
-        SpreadsheetApp.flush();
-        setCell_(sheet, row, headers, type + '日時', Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy/MM/dd HH:mm:ss'));
-        setCell_(sheet, row, headers, type + 'エラー', '');
-      } catch (resendErr) {
-        setCell_(sheet, row, headers, type + '済み', 'エラー');
-        setCell_(sheet, row, headers, type + '日時', Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy/MM/dd HH:mm:ss'));
-        setCell_(sheet, row, headers, type + 'エラー', 'Resend fallback失敗: ' + String(resendErr));
-      }
-    } else {
-      setCell_(sheet, row, headers, type + '済み', 'エラー');
-      setCell_(sheet, row, headers, type + '日時', Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy/MM/dd HH:mm:ss'));
-      setCell_(sheet, row, headers, type + 'エラー', String(gmailErr));
+    if (!isQuotaError_(gmailErr)) {
+      return setError_(sheet, row, headers, type, String(gmailErr));
+    }
+    try {
+      sendViaResend_(to, subject, body, computeChikemoMainIdempotencyKey_(type, to, subject, body));
+    } catch (resendErr) {
+      return setError_(sheet, row, headers, type, 'Resend fallback失敗: ' + String(resendErr));
     }
   }
+
+  setCell_(sheet, row, headers, type + '済み', '送信済み');
+  SpreadsheetApp.flush();
+  setCell_(sheet, row, headers, type + '日時', Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy/MM/dd HH:mm:ss'));
+  setCell_(sheet, row, headers, type + 'エラー', '');
 }
 
 // ===== Gmail クォータエラー判定 =====
@@ -221,7 +215,7 @@ function sendViaResend_(to, subject, body, idempotencyKey) {
 
   var code = res.getResponseCode();
   if (code === 409) {
-    throw new Error('同じ内容のメールを別の処理が送信中です。二重送信を防ぐため送っていません: ' + res.getContentText());
+    throw new Error('同じ内容のメールを別の処理が送信中です。二重送信を防ぐため送っていません。入金欄は入れ直さず、しばらく後に送信結果を確認してください: ' + res.getContentText());
   }
   if (code < 200 || code >= 300) {
     throw new Error('Resend API error ' + code + ': ' + res.getContentText());

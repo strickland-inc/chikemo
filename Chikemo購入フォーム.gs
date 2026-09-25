@@ -213,7 +213,7 @@ function sendChikemoPurchaseFormViaResend_(to, subject, body, idempotencyKey) {
   var status = response.getResponseCode();
   if (status === 409) {
     throw new Error(
-      '同じ内容のメールを別の処理が送信中です。二重送信を防ぐため送っていません: ' + response.getContentText(),
+      '同じ内容のメールを別の処理が送信中です。二重送信を防ぐため送っていません。入金欄は入れ直さず、しばらく後に送信結果を確認してください: ' + response.getContentText(),
     );
   }
   if (status < 200 || status >= 300) {
@@ -324,6 +324,7 @@ function sendTestRow8466ViaResend() {
 
     var body = buildChikemoPurchaseFormBody_(data);
 
+    // 送信と記録を同じ try に入れない。記録の失敗で「エラー」を書くと、届いたのに未送信に見えて再送を招く。
     try {
       sendChikemoPurchaseFormViaResend_(
         data.email,
@@ -331,17 +332,18 @@ function sendTestRow8466ViaResend() {
         body,
         computeChikemoPurchaseFormIdempotencyKey_(data.email, CHIKEMO_PURCHASE_FORM.subject, body),
       );
-      sheet.getRange(row, columns.sendResult).setValue('送信済み');
-      SpreadsheetApp.flush();
-      sheet.getRange(row, columns.sendMessage).setValue('');
-      sheet.getRange(row, columns.paymentDate).setValue(
-        Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy/MM/dd HH:mm:ss')
-      );
-      console.log('8466行目のResend送信成功');
     } catch (error) {
       setChikemoPurchaseFormError_(sheet, row, 'Resendテスト失敗: ' + String(error));
       throw error;
     }
+
+    sheet.getRange(row, columns.sendResult).setValue('送信済み');
+    SpreadsheetApp.flush();
+    sheet.getRange(row, columns.sendMessage).setValue('');
+    sheet.getRange(row, columns.paymentDate).setValue(
+      Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy/MM/dd HH:mm:ss')
+    );
+    console.log('8466行目のResend送信成功');
   });
 
   if (!lockResult.locked) {

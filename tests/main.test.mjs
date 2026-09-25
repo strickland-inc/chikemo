@@ -364,3 +364,19 @@ test('メイン.gsとChikemo購入フォーム.gsは1つのコンテキストで
   assert.equal(typeof combinedContext.withChikemoPurchaseFormSendLock_, 'function');
   assert.equal(typeof combinedContext.withChikemoMainSendLock_, 'function');
 });
+
+test('Gmailで送った後に記録の書き込みが失敗しても、Resendでもう1通送らない', () => {
+  const cells = baseShippingCells();
+  const { context, resendRequests, sent, sheet } = loadScript({ cells });
+  // 送信直後の flush が流量制限で落ちる状況。文言に too many を含むのでクォータ判定に一致する。
+  let flushCount = 0;
+  context.SpreadsheetApp.flush = () => {
+    flushCount += 1;
+    if (flushCount === 1) throw new Error('Service invoked too many times in a short time: spreadsheets.');
+  };
+
+  assert.throws(() => context.handleEdit({ range: createRange(sheet, 3, COL['入金'], 'OK') }), /too many/);
+
+  assert.equal(sent.length, 1);
+  assert.equal(resendRequests.length, 0);
+});
