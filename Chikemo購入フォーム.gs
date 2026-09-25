@@ -45,7 +45,37 @@ function handleChikemoPurchaseFormEdit(e) {
     }
   }
 
-  sendChikemoPurchaseFormPaymentEmail_(sheet, range.getRow());
+  var lockResult = withChikemoPurchaseFormSendLock_(function() {
+    sendChikemoPurchaseFormPaymentEmail_(sheet, range.getRow());
+  });
+  if (!lockResult.locked) {
+    setChikemoPurchaseFormLockBusyMessage_(sheet, range.getRow());
+  }
+}
+
+// ロックが取れなかった行には送信メッセージ欄だけを書く。送信結果欄を「エラー」にすると、
+// 実行中の処理が書いた「送信済み」を消し、次の編集で再送してしまうため触らない。
+function setChikemoPurchaseFormLockBusyMessage_(sheet, row) {
+  sheet.getRange(row, CHIKEMO_PURCHASE_FORM.columns.sendMessage).setValue(
+    '別の送信処理が実行中のため未処理です。少し待ってから入金欄を入れ直してください',
+  );
+}
+
+// 送信済みの確認・送信・記録を1つのスクリプトロックで囲む共通ヘルパー。
+// fn内でさらにこのロックを取り直さないこと（二重取得を避ける）。
+function withChikemoPurchaseFormSendLock_(fn) {
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(30000)) return { locked: false };
+  try {
+    fn();
+  } finally {
+    try {
+      SpreadsheetApp.flush();
+    } finally {
+      lock.releaseLock();
+    }
+  }
+  return { locked: true };
 }
 
 function sendChikemoPurchaseFormPaymentEmail_(sheet, row) {
@@ -87,7 +117,12 @@ function sendChikemoPurchaseFormPaymentEmail_(sheet, row) {
   } catch (gmailError) {
     if (isChikemoPurchaseFormQuotaError_(gmailError)) {
       try {
-        sendChikemoPurchaseFormViaResend_(data.email, CHIKEMO_PURCHASE_FORM.subject, body);
+        sendChikemoPurchaseFormViaResend_(
+          data.email,
+          CHIKEMO_PURCHASE_FORM.subject,
+          body,
+          computeChikemoPurchaseFormIdempotencyKey_(data.email, CHIKEMO_PURCHASE_FORM.subject, body),
+        );
       } catch (resendError) {
         setChikemoPurchaseFormError_(sheet, row, 'Resend fallback失敗: ' + String(resendError));
         return;
@@ -99,6 +134,7 @@ function sendChikemoPurchaseFormPaymentEmail_(sheet, row) {
   }
 
   sheet.getRange(row, columns.sendResult).setValue('送信済み');
+  SpreadsheetApp.flush();
   sheet.getRange(row, columns.sendMessage).setValue('');
   sheet.getRange(row, columns.paymentDate).setValue(
     Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy/MM/dd HH:mm:ss'),
@@ -153,14 +189,17 @@ function isChikemoPurchaseFormQuotaError_(error) {
     message.indexOf('too many') !== -1;
 }
 
-function sendChikemoPurchaseFormViaResend_(to, subject, body) {
+function sendChikemoPurchaseFormViaResend_(to, subject, body, idempotencyKey) {
   var apiKey = PropertiesService.getScriptProperties().getProperty('RESEND_API_KEY');
   if (!apiKey) throw new Error('RESEND_API_KEY が未設定');
+
+  var headers = { Authorization: 'Bearer ' + apiKey };
+  if (idempotencyKey) headers['Idempotency-Key'] = idempotencyKey;
 
   var response = UrlFetchApp.fetch('https://api.resend.com/emails', {
     method: 'post',
     contentType: 'application/json',
-    headers: { Authorization: 'Bearer ' + apiKey },
+    headers: headers,
     payload: JSON.stringify({
       from: CHIKEMO_PURCHASE_FORM.senderName + ' <' + CHIKEMO_PURCHASE_FORM.senderEmail + '>',
       to: [to],
@@ -172,9 +211,25 @@ function sendChikemoPurchaseFormViaResend_(to, subject, body) {
   });
 
   var status = response.getResponseCode();
+  if (status === 409) {
+    throw new Error(
+      '同じ内容のメールを別の処理が送信中です。二重送信を防ぐため送っていません: ' + response.getContentText(),
+    );
+  }
   if (status < 200 || status >= 300) {
     throw new Error('Resend API error ' + status + ': ' + response.getContentText());
   }
+}
+
+// 宛先・件名・本文からResendのIdempotency-Keyを作る。同じ内容なら常に同じキーになる。
+function computeChikemoPurchaseFormIdempotencyKey_(to, subject, body) {
+  var text = [String(to).toLowerCase().trim(), subject, body].join('\n');
+  var digestBytes = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, text, Utilities.Charset.UTF_8);
+  var hex = '';
+  for (var i = 0; i < digestBytes.length; i++) {
+    hex += ('0' + ((digestBytes[i] + 256) % 256).toString(16)).slice(-2);
+  }
+  return ('chikemo-purchase/tracking/' + hex).slice(0, 256);
 }
 
 // Apps Scriptエディタから chikemo.info@chikemo.net で1回だけ実行する。
@@ -240,46 +295,57 @@ function sendTestRow8466ViaResend() {
   var sheet = spreadsheet.getSheetByName(CHIKEMO_PURCHASE_FORM.sheetName);
   if (!sheet) throw new Error('対象シートが見つかりません');
 
-  var columns = CHIKEMO_PURCHASE_FORM.columns;
-  if (getChikemoPurchaseFormCell_(sheet, row, columns.sendResult) === '送信済み') {
-    throw new Error('8466行目は送信済みです');
-  }
+  var lockResult = withChikemoPurchaseFormSendLock_(function() {
+    var columns = CHIKEMO_PURCHASE_FORM.columns;
+    if (getChikemoPurchaseFormCell_(sheet, row, columns.sendResult) === '送信済み') {
+      throw new Error('8466行目は送信済みです');
+    }
 
-  var data = {
-    quantity: getChikemoPurchaseFormCell_(sheet, row, columns.quantity),
-    name: getChikemoPurchaseFormCell_(sheet, row, columns.name),
-    email: getChikemoPurchaseFormCell_(sheet, row, columns.email),
-    deliveryName: getChikemoPurchaseFormCell_(sheet, row, columns.deliveryName),
-    deliveryAddress: getChikemoPurchaseFormCell_(sheet, row, columns.deliveryAddress),
-    tracking: getChikemoPurchaseFormCell_(sheet, row, columns.tracking),
-  };
+    var data = {
+      quantity: getChikemoPurchaseFormCell_(sheet, row, columns.quantity),
+      name: getChikemoPurchaseFormCell_(sheet, row, columns.name),
+      email: getChikemoPurchaseFormCell_(sheet, row, columns.email),
+      deliveryName: getChikemoPurchaseFormCell_(sheet, row, columns.deliveryName),
+      deliveryAddress: getChikemoPurchaseFormCell_(sheet, row, columns.deliveryAddress),
+      tracking: getChikemoPurchaseFormCell_(sheet, row, columns.tracking),
+    };
 
-  var required = [
-    ['メールアドレス', data.email],
-    ['お名前', data.name],
-    ['購入枚数', data.quantity],
-    ['送付先名', data.deliveryName],
-    ['送付先住所', data.deliveryAddress],
-    ['追跡番号', data.tracking],
-  ];
-  for (var i = 0; i < required.length; i++) {
-    if (!required[i][1]) throw new Error(required[i][0] + 'が空');
-  }
+    var required = [
+      ['メールアドレス', data.email],
+      ['お名前', data.name],
+      ['購入枚数', data.quantity],
+      ['送付先名', data.deliveryName],
+      ['送付先住所', data.deliveryAddress],
+      ['追跡番号', data.tracking],
+    ];
+    for (var i = 0; i < required.length; i++) {
+      if (!required[i][1]) throw new Error(required[i][0] + 'が空');
+    }
 
-  try {
-    sendChikemoPurchaseFormViaResend_(
-      data.email,
-      CHIKEMO_PURCHASE_FORM.subject,
-      buildChikemoPurchaseFormBody_(data)
-    );
-    sheet.getRange(row, columns.sendResult).setValue('送信済み');
-    sheet.getRange(row, columns.sendMessage).setValue('');
-    sheet.getRange(row, columns.paymentDate).setValue(
-      Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy/MM/dd HH:mm:ss')
-    );
-    console.log('8466行目のResend送信成功');
-  } catch (error) {
-    setChikemoPurchaseFormError_(sheet, row, 'Resendテスト失敗: ' + String(error));
-    throw error;
+    var body = buildChikemoPurchaseFormBody_(data);
+
+    try {
+      sendChikemoPurchaseFormViaResend_(
+        data.email,
+        CHIKEMO_PURCHASE_FORM.subject,
+        body,
+        computeChikemoPurchaseFormIdempotencyKey_(data.email, CHIKEMO_PURCHASE_FORM.subject, body),
+      );
+      sheet.getRange(row, columns.sendResult).setValue('送信済み');
+      SpreadsheetApp.flush();
+      sheet.getRange(row, columns.sendMessage).setValue('');
+      sheet.getRange(row, columns.paymentDate).setValue(
+        Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy/MM/dd HH:mm:ss')
+      );
+      console.log('8466行目のResend送信成功');
+    } catch (error) {
+      setChikemoPurchaseFormError_(sheet, row, 'Resendテスト失敗: ' + String(error));
+      throw error;
+    }
+  });
+
+  if (!lockResult.locked) {
+    setChikemoPurchaseFormLockBusyMessage_(sheet, row);
+    throw new Error('別の送信処理が実行中のため未処理です。');
   }
 }

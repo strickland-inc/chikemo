@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
@@ -24,12 +25,14 @@ function loadScript({
   effectiveUser = 'chikemo.info@chikemo.net',
   gmailError = null,
   resendStatus = 200,
+  lockAcquirable = true,
 } = {}) {
   const writes = [];
   const sent = [];
   const resendRequests = [];
   const createdTriggers = [];
   const deletedTriggers = [];
+  const callOrder = [];
 
   const headers = {
     H1: '購入枚数',
@@ -56,6 +59,7 @@ function loadScript({
         setValue(value) {
           cells[`${row}:${column}`] = value;
           writes.push({ row, column, value });
+          if (value === '送信済み') callOrder.push('write:sendResult');
         },
       };
     },
@@ -119,7 +123,23 @@ function loadScript({
       });
     },
     Session: { getEffectiveUser: () => ({ getEmail: () => effectiveUser }) },
-    SpreadsheetApp: { openById: () => spreadsheet },
+    LockService: {
+      getScriptLock: () => ({
+        tryLock() {
+          callOrder.push('tryLock');
+          return lockAcquirable;
+        },
+        releaseLock() {
+          callOrder.push('releaseLock');
+        },
+      }),
+    },
+    SpreadsheetApp: {
+      openById: () => spreadsheet,
+      flush() {
+        callOrder.push('flush');
+      },
+    },
     UrlFetchApp: {
       fetch(url, options) {
         resendRequests.push({ url, options });
@@ -129,12 +149,17 @@ function loadScript({
         };
       },
     },
-    Utilities: { formatDate: () => '2026/07/23 12:34:56' },
+    Utilities: {
+      formatDate: () => '2026/07/23 12:34:56',
+      computeDigest: (algorithm, text) => Array.from(crypto.createHash('sha256').update(text, 'utf8').digest()),
+      DigestAlgorithm: { SHA_256: 'SHA_256' },
+      Charset: { UTF_8: 'UTF_8' },
+    },
   };
 
   vm.createContext(context);
   vm.runInContext(fs.readFileSync(sourcePath, 'utf8'), context, { filename: sourcePath });
-  return { context, createdTriggers, deletedTriggers, resendRequests, sent, sheet, spreadsheet, writes };
+  return { callOrder, context, createdTriggers, deletedTriggers, resendRequests, sent, sheet, spreadsheet, writes };
 }
 
 test('U列をOKにすると指定本文で追跡番号メールを1通送る', () => {
@@ -323,4 +348,134 @@ test('Resend送信はChikemoの安定運用どおりメールAPIだけを使用�
   assert.match(source, /https:\/\/api\.resend\.com\/emails/);
   assert.doesNotMatch(source, /https:\/\/api\.resend\.com\/domains/);
   assert.doesNotMatch(source, /re_[A-Za-z0-9]{10,}/);
+});
+
+test('送信はロック内で確認・送信・記録が行われ、releaseLockの前にflushが呼ばれる', () => {
+  const cells = {
+    '3:8': '2',
+    '3:9': '山田太郎',
+    '3:11': 'customer@example.com',
+    '3:13': '山田太郎',
+    '3:14': '東京都千代田区1-1',
+    '3:21': 'OK',
+    '3:23': 'ABCD123456JP',
+  };
+  const { callOrder, context, sheet } = loadScript({ cells });
+
+  context.handleChikemoPurchaseFormEdit({ range: createRange(sheet, 3, 21, 'OK') });
+
+  assert.deepEqual(callOrder, ['tryLock', 'write:sendResult', 'flush', 'flush', 'releaseLock']);
+});
+
+test('ロックが取れないとGmailもResendも呼ばれず、送信結果欄は触らずメッセージ欄だけに書く', () => {
+  const cells = {
+    '3:8': '2',
+    '3:9': '山田太郎',
+    '3:11': 'customer@example.com',
+    '3:13': '山田太郎',
+    '3:14': '東京都千代田区1-1',
+    '3:21': 'OK',
+    '3:23': 'ABCD123456JP',
+  };
+  const { context, resendRequests, sent, sheet, writes } = loadScript({ cells, lockAcquirable: false });
+
+  context.handleChikemoPurchaseFormEdit({ range: createRange(sheet, 3, 21, 'OK') });
+
+  assert.equal(sent.length, 0);
+  assert.equal(resendRequests.length, 0);
+  assert.deepEqual(
+    writes.map(({ row, column, value }) => ({ row, column, value })),
+    [
+      { row: 3, column: 31, value: '別の送信処理が実行中のため未処理です。少し待ってから入金欄を入れ直してください' },
+    ],
+  );
+});
+
+test('1回目の実行で送信済みになった行を2回目の実行が送らない', () => {
+  const cells = {
+    '3:8': '2',
+    '3:9': '山田太郎',
+    '3:11': 'customer@example.com',
+    '3:13': '山田太郎',
+    '3:14': '東京都千代田区1-1',
+    '3:21': 'OK',
+    '3:23': 'ABCD123456JP',
+  };
+  const { context, sent, sheet } = loadScript({ cells });
+  const event = { range: createRange(sheet, 3, 21, 'OK') };
+
+  context.handleChikemoPurchaseFormEdit(event);
+  context.handleChikemoPurchaseFormEdit(event);
+
+  assert.equal(sent.length, 1);
+});
+
+test('Resend送信にIdempotency-Keyヘッダーが付き、同じ内容なら同じキーになる', () => {
+  const cells = {
+    '3:8': '2',
+    '3:9': '山田太郎',
+    '3:11': 'customer@example.com',
+    '3:13': '山田太郎',
+    '3:14': '東京都千代田区1-1',
+    '3:21': 'OK',
+    '3:23': 'ABCD123456JP',
+  };
+  const gmailError = new Error('Service invoked too many times: email quota');
+
+  const first = loadScript({ cells: { ...cells }, gmailError });
+  first.context.handleChikemoPurchaseFormEdit({ range: createRange(first.sheet, 3, 21, 'OK') });
+
+  const second = loadScript({ cells: { ...cells }, gmailError });
+  second.context.handleChikemoPurchaseFormEdit({ range: createRange(second.sheet, 3, 21, 'OK') });
+
+  const key1 = first.resendRequests[0].options.headers['Idempotency-Key'];
+  const key2 = second.resendRequests[0].options.headers['Idempotency-Key'];
+  assert.match(key1, /^chikemo-purchase\/tracking\/[0-9a-f]+$/);
+  assert.equal(key1, key2);
+});
+
+test('本文が1文字違えばIdempotency-Keyが変わる', () => {
+  const baseCells = {
+    '3:8': '2',
+    '3:9': '山田太郎',
+    '3:11': 'customer@example.com',
+    '3:13': '山田太郎',
+    '3:14': '東京都千代田区1-1',
+    '3:21': 'OK',
+    '3:23': 'ABCD123456JP',
+  };
+  const changedCells = { ...baseCells, '3:23': 'ABCD123456JQ' };
+  const gmailError = new Error('Service invoked too many times: email quota');
+
+  const first = loadScript({ cells: baseCells, gmailError });
+  first.context.handleChikemoPurchaseFormEdit({ range: createRange(first.sheet, 3, 21, 'OK') });
+
+  const second = loadScript({ cells: changedCells, gmailError });
+  second.context.handleChikemoPurchaseFormEdit({ range: createRange(second.sheet, 3, 21, 'OK') });
+
+  const key1 = first.resendRequests[0].options.headers['Idempotency-Key'];
+  const key2 = second.resendRequests[0].options.headers['Idempotency-Key'];
+  assert.notEqual(key1, key2);
+});
+
+test('Resendが409を返したら二重送信防止のエラーメッセージを記録する', () => {
+  const cells = {
+    '3:8': '2',
+    '3:9': '山田太郎',
+    '3:11': 'customer@example.com',
+    '3:13': '山田太郎',
+    '3:14': '東京都千代田区1-1',
+    '3:21': 'OK',
+    '3:23': 'ABCD123456JP',
+  };
+  const { context, sheet, writes } = loadScript({
+    cells,
+    gmailError: new Error('Service invoked too many times: email quota'),
+    resendStatus: 409,
+  });
+
+  context.handleChikemoPurchaseFormEdit({ range: createRange(sheet, 3, 21, 'OK') });
+
+  const errorWrite = writes.find((w) => w.column === 31);
+  assert.match(errorWrite.value, /同じ内容のメールを別の処理が送信中です。二重送信を防ぐため送っていません/);
 });

@@ -41,6 +41,9 @@ Never run `clasp push` without explicitly selecting and verifying the intended c
 - Resend must call the `/emails` API directly; do not add a domain-preflight request to the send path.
 - `RESEND_API_KEY` belongs in Apps Script script properties. Never save its value in files or Git.
 - Installable edit triggers must not use the simple-trigger function name `onEdit`.
+- 送信済みの確認・送信・記録は`LockService.getScriptLock()`の`tryLock(30000)`で1つに囲む。確認は必ずロック取得後にシートから読み直す。`SpreadsheetApp.flush()`は「送信済み」書き込み直後とロック解放直前の両方で呼ぶ。ロックが取れない時は送らず、エラー欄（購入フォームは送信メッセージ欄）だけに書く。「送信済み」の欄を「エラー」で上書きすると、実行中の処理が付けた印が消えて次の編集で再送するため触らない。
+- Resend送信には冪等性のため`Idempotency-Key`ヘッダーを付ける。宛先・件名・本文から作るSHA-256ハッシュに接頭辞を付け、購入フォームは`chikemo-purchase/tracking/`、メインは発送通知が`chikemo/shipping/`、キャンセル通知が`chikemo/cancel/`を使う。
+- 既定の`.claspignore`は`メイン.gs`と`Chikemo購入フォーム.gs`の両方を同じApps Scriptプロジェクトへpushする。同じグローバル空間に同居しうるため、新しい関数名・変数名は2ファイル間で重複させない。
 
 ## Existing GAS Constraints
 

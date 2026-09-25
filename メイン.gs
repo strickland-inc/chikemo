@@ -44,12 +44,43 @@ function handleEdit(e) {
       }
     }
 
-    if (value === 'OK') sendShippingNotification_(sheet, row, headers);
-    if (value === 'NG') sendCancellationNotification_(sheet, row, headers);
+    if (value === 'OK') {
+      var shippingLockResult = withChikemoMainSendLock_(function() {
+        sendShippingNotification_(sheet, row, headers);
+      });
+      if (!shippingLockResult.locked) {
+        setLockBusyError_(sheet, row, headers, '発送通知');
+      }
+    }
+    if (value === 'NG') {
+      var cancelLockResult = withChikemoMainSendLock_(function() {
+        sendCancellationNotification_(sheet, row, headers);
+      });
+      if (!cancelLockResult.locked) {
+        setLockBusyError_(sheet, row, headers, 'キャンセル通知');
+      }
+    }
   } catch (err) {
     console.error('handleEdit failed:', err, 'row=', e && e.range && e.range.getRow());
     throw err;
   }
+}
+
+// 送信済みの確認・送信・記録を1つのスクリプトロックで囲む共通ヘルパー。
+// fn内でさらにこのロックを取り直さないこと（二重取得を避ける。reprocessUnsentはループ全体を1回だけ囲む）。
+function withChikemoMainSendLock_(fn) {
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(30000)) return { locked: false };
+  try {
+    fn();
+  } finally {
+    try {
+      SpreadsheetApp.flush();
+    } finally {
+      lock.releaseLock();
+    }
+  }
+  return { locked: true };
 }
 
 // ===== 発送通知メール =====
@@ -134,13 +165,15 @@ function sendEmail_(sheet, row, headers, type, to, subject, body) {
       replyTo: CONFIG.contactEmail,
     });
     setCell_(sheet, row, headers, type + '済み', '送信済み');
+    SpreadsheetApp.flush();
     setCell_(sheet, row, headers, type + '日時', Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy/MM/dd HH:mm:ss'));
     setCell_(sheet, row, headers, type + 'エラー', '');
   } catch (gmailErr) {
     if (isQuotaError_(gmailErr)) {
       try {
-        sendViaResend_(to, subject, body);
+        sendViaResend_(to, subject, body, computeChikemoMainIdempotencyKey_(type, to, subject, body));
         setCell_(sheet, row, headers, type + '済み', '送信済み');
+        SpreadsheetApp.flush();
         setCell_(sheet, row, headers, type + '日時', Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy/MM/dd HH:mm:ss'));
         setCell_(sheet, row, headers, type + 'エラー', '');
       } catch (resendErr) {
@@ -165,14 +198,17 @@ function isQuotaError_(err) {
 }
 
 // ===== Resend API によるメール送信 =====
-function sendViaResend_(to, subject, body) {
+function sendViaResend_(to, subject, body, idempotencyKey) {
   var apiKey = PropertiesService.getScriptProperties().getProperty('RESEND_API_KEY');
   if (!apiKey) throw new Error('RESEND_API_KEY が未設定');
+
+  var headers = { 'Authorization': 'Bearer ' + apiKey };
+  if (idempotencyKey) headers['Idempotency-Key'] = idempotencyKey;
 
   var res = UrlFetchApp.fetch('https://api.resend.com/emails', {
     method: 'post',
     contentType: 'application/json',
-    headers: { 'Authorization': 'Bearer ' + apiKey },
+    headers: headers,
     payload: JSON.stringify({
       from: CONFIG.resendFrom,
       to: [to],
@@ -184,9 +220,30 @@ function sendViaResend_(to, subject, body) {
   });
 
   var code = res.getResponseCode();
+  if (code === 409) {
+    throw new Error('同じ内容のメールを別の処理が送信中です。二重送信を防ぐため送っていません: ' + res.getContentText());
+  }
   if (code < 200 || code >= 300) {
     throw new Error('Resend API error ' + code + ': ' + res.getContentText());
   }
+}
+
+// type（発送通知／キャンセル通知）ごとに接頭辞を変え、宛先・件名・本文からIdempotency-Keyを作る。
+function computeChikemoMainIdempotencyKey_(type, to, subject, body) {
+  var prefix = type === '発送通知' ? 'chikemo/shipping/' : 'chikemo/cancel/';
+  var text = [String(to).toLowerCase().trim(), subject, body].join('\n');
+  var digestBytes = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, text, Utilities.Charset.UTF_8);
+  var hex = '';
+  for (var i = 0; i < digestBytes.length; i++) {
+    hex += ('0' + ((digestBytes[i] + 256) % 256).toString(16)).slice(-2);
+  }
+  return (prefix + hex).slice(0, 256);
+}
+
+// ロックが取れなかった行にはエラー欄だけを書く。「〜済み」欄を「エラー」にすると、
+// 実行中の処理が書いた「送信済み」を消し、次の編集で再送してしまうため触らない。
+function setLockBusyError_(sheet, row, headers, type) {
+  setCell_(sheet, row, headers, type + 'エラー', '別の送信処理が実行中のため未処理です。少し待ってから入金欄を入れ直してください');
 }
 
 function setError_(sheet, row, headers, type, message) {
@@ -352,13 +409,22 @@ function reprocessUnsent() {
   var statuses = sheet.getRange(2, statusCol, lastRow - 1, 1).getValues();
   var processed = 0;
 
-  for (var i = 0; i < payments.length; i++) {
-    var payment = String(payments[i][0]).trim();
-    var status = String(statuses[i][0]).trim();
-    if (payment === 'OK' && status !== '送信済み') {
-      sendShippingNotification_(sheet, 2 + i, headers);
-      processed++;
+  // ループ全体を1回のロックで囲む。内側の sendShippingNotification_ は
+  // ロックを取り直さない（withChikemoMainSendLock_ の二重取得を避けるため）。
+  var lockResult = withChikemoMainSendLock_(function() {
+    for (var i = 0; i < payments.length; i++) {
+      var payment = String(payments[i][0]).trim();
+      var status = String(statuses[i][0]).trim();
+      if (payment === 'OK' && status !== '送信済み') {
+        sendShippingNotification_(sheet, 2 + i, headers);
+        processed++;
+      }
     }
+  });
+
+  if (!lockResult.locked) {
+    Logger.log('別の送信処理が実行中のため reprocessUnsent を中断しました');
+    return;
   }
 
   Logger.log('reprocessUnsent 完了: ' + processed + ' 件処理');
