@@ -21,6 +21,19 @@ var COLUMN_FALLBACKS = {
 // NOTE: 関数名を onEdit にすると simple trigger として自動発火し、
 // AuthMode.LIMITED で GmailApp が権限エラーになるため handleEdit にしている。
 function handleEdit(e) {
+  if (!e || !e.range || e.range.getRow() <= 1) return;
+
+  // 同時編集で取りこぼさないよう、処理を直列化する
+  var lock = LockService.getDocumentLock();
+  lock.waitLock(30000);
+  try {
+    processEdit_(e);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function processEdit_(e) {
   try {
     if (!e || !e.range || e.range.getRow() <= 1) return;
 
@@ -324,17 +337,19 @@ function setupMonitoringFormula() {
   sheet.getRange('AJ2').setFormula(
     '=ARRAYFORMULA(IF(S2:S="","",' +
       'IF((S2:S="OK")*(AD2:AD="エラー"),"要確認：発送通知エラー",' +
-        'IF((S2:S="OK")*(AD2:AD<>"送信済み"),"要確認：GASのsetupTrigger関数を実行して権限を承認してください（発送通知未完了）",' +
+        'IF((S2:S="OK")*(AD2:AD<>"送信済み"),"要確認：発送通知が未送信です。GASのreprocessUnsent関数を実行してください",' +
           'IF((S2:S="NG")*(AG2:AG="エラー"),"要確認：キャンセル通知エラー",' +
-            'IF((S2:S="NG")*(AG2:AG<>"送信済み"),"要確認：GASのsetupTrigger関数を実行して権限を承認してください（キャンセル通知未完了）",""))))))'
+            'IF((S2:S="NG")*(AG2:AG<>"送信済み"),"要確認：キャンセル通知が未送信です。GASのreprocessUnsent関数を実行してください",""))))))'
   );
 
   Logger.log('処理監視列（AJ列）に ARRAYFORMULA 設定完了');
 }
 
-// 入金=OK かつ 発送通知済みが「送信済み」以外の行を一括再送する緊急リカバリ関数。
+// 入金=OK かつ 発送通知済みが「送信済み」以外、
+// および 入金=NG かつ キャンセル通知済みが「送信済み」以外の行を一括再送する緊急リカバリ関数。
 // トリガー失敗/無言スキップが疑われる時にエディタから手動実行する。
-// sendShippingNotification_ 側で既送信行は自動スキップされるので二重送信にならない。
+// 実行前に対象行（AJ列の警告行）を確認すること。
+// send*Notification_ 側で既送信行は自動スキップされるので二重送信にならない。
 function reprocessUnsent() {
   var sheet = SpreadsheetApp.getActive().getSheetByName('シート1');
   var lastRow = sheet.getLastRow();
@@ -342,26 +357,31 @@ function reprocessUnsent() {
 
   var headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
   var paymentCol = findColumn_(headers, '入金');
-  var statusCol = findColumn_(headers, '発送通知済み');
-  if (paymentCol === 0 || statusCol === 0) {
-    Logger.log('入金 or 発送通知済み 列が見つかりません');
+  var shipStatusCol = findColumn_(headers, '発送通知済み');
+  var cancelStatusCol = findColumn_(headers, 'キャンセル通知済み');
+  if (paymentCol === 0 || shipStatusCol === 0 || cancelStatusCol === 0) {
+    Logger.log('入金 / 発送通知済み / キャンセル通知済み 列が見つかりません');
     return;
   }
 
   var payments = sheet.getRange(2, paymentCol, lastRow - 1, 1).getValues();
-  var statuses = sheet.getRange(2, statusCol, lastRow - 1, 1).getValues();
-  var processed = 0;
+  var shipStatuses = sheet.getRange(2, shipStatusCol, lastRow - 1, 1).getValues();
+  var cancelStatuses = sheet.getRange(2, cancelStatusCol, lastRow - 1, 1).getValues();
+  var shipped = 0;
+  var cancelled = 0;
 
   for (var i = 0; i < payments.length; i++) {
     var payment = String(payments[i][0]).trim();
-    var status = String(statuses[i][0]).trim();
-    if (payment === 'OK' && status !== '送信済み') {
+    if (payment === 'OK' && String(shipStatuses[i][0]).trim() !== '送信済み') {
       sendShippingNotification_(sheet, 2 + i, headers);
-      processed++;
+      shipped++;
+    } else if (payment === 'NG' && String(cancelStatuses[i][0]).trim() !== '送信済み') {
+      sendCancellationNotification_(sheet, 2 + i, headers);
+      cancelled++;
     }
   }
 
-  Logger.log('reprocessUnsent 完了: ' + processed + ' 件処理');
+  Logger.log('reprocessUnsent 完了: 発送通知 ' + shipped + ' 件 / キャンセル通知 ' + cancelled + ' 件処理');
 }
 
 function testResend() {

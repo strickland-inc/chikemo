@@ -50,7 +50,8 @@ Never run `clasp push` without explicitly selecting and verifying the intended c
 - 入金列への複数行貼り付けでは先頭行だけを処理し、残りへ警告を書く。通常運用では1行ずつ入力する。
 - R列とV〜AA列の自動転記はSpreadsheetのARRAYFORMULAで行い、`setupArrayFormulas()`で設定する。
 - AJ列の処理監視はSpreadsheet関数で行い、`setupMonitoringFormula()`で設定する。監視列自体はメールを送信しない。
-- 未送信の復旧には`reprocessUnsent()`を使用する。実行前に対象行と既送信ガードを確認する。
+- 未送信の復旧には`reprocessUnsent()`を使用する（入金=OKの発送通知と入金=NGのキャンセル通知の両方が対象）。実行前に対象行と既送信ガードを確認する。
+- `handleEdit`は`LockService`で同時編集を直列化する。
 
 ## Git And Verification
 
