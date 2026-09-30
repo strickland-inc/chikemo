@@ -44,25 +44,39 @@ function processEdit_(e) {
     var row = e.range.getRow();
     var paymentCol = findColumn_(headers, '入金');
 
-    // 入金列以外の編集は無視
-    if (paymentCol === 0 || e.range.getColumn() !== paymentCol) return;
-    var value = String(e.range.getValue()).trim();
+    // 編集範囲に入金列が含まれない場合は無視する。
+    // 複数列にまたがる貼り付けでも入金列を取りこぼさないよう、範囲の先頭列ではなく包含で判定する。
+    if (paymentCol === 0 || paymentCol < e.range.getColumn() || paymentCol > e.range.getLastColumn()) return;
+
+    // 編集イベントの値ではなく、セルの現在値を読む（複数列貼り付けで先頭セルが入金列とは限らないため）
+    var value = normalizePayment_(sheet.getRange(row, paymentCol).getValue());
+    console.log('handleEdit row=' + row + ' rows=' + e.range.getNumRows() + ' value=' + value);
 
     // コピペ等で複数行同時編集された場合、先頭行のみ処理し残り行に警告を書く
-    if (e.range.getNumRows() > 1 && (value === 'OK' || value === 'NG')) {
-      var prefix = value === 'OK' ? '発送通知' : 'キャンセル通知';
-      for (var r = row + 1; r <= e.range.getLastRow(); r++) {
-        setCell_(sheet, r, headers, prefix + 'エラー',
-          '複数行まとめて ' + value + ' が入力されました。この行は未処理です。個別に OK を入れ直してください');
+    if (e.range.getNumRows() > 1) {
+      var rest = sheet.getRange(row + 1, paymentCol, e.range.getNumRows() - 1, 1).getValues();
+      for (var i = 0; i < rest.length; i++) {
+        var restValue = normalizePayment_(rest[i][0]);
+        if (restValue !== 'OK' && restValue !== 'NG') continue;
+        var prefix = restValue === 'OK' ? '発送通知' : 'キャンセル通知';
+        setCell_(sheet, row + 1 + i, headers, prefix + 'エラー',
+          '複数行まとめて ' + restValue + ' が入力されました。この行は未処理です。個別に ' + restValue + ' を入れ直してください');
       }
     }
 
     if (value === 'OK') sendShippingNotification_(sheet, row, headers);
-    if (value === 'NG') sendCancellationNotification_(sheet, row, headers);
+    else if (value === 'NG') sendCancellationNotification_(sheet, row, headers);
+    else if (value) console.warn('入金列の値が OK/NG ではないため処理しません: value=' + value + ' row=' + row);
   } catch (err) {
     console.error('handleEdit failed:', err, 'row=', e && e.range && e.range.getRow());
     throw err;
   }
+}
+
+// スプレッドシートの = 比較は大文字小文字を区別しないため、AJ列は "ok" でも警告を出す。
+// 処理側も同じ基準（全角半角・前後空白・大文字小文字を無視）で判定して取りこぼしを防ぐ。
+function normalizePayment_(value) {
+  return String(value).normalize('NFKC').trim().toUpperCase();
 }
 
 // ===== 発送通知メール =====
@@ -268,6 +282,8 @@ function getHeaderAliases_(name) {
 }
 
 // ===== トリガー管理 =====
+// 各 remove は対象の関数のトリガーだけを削除する。
+// 全トリガーを削除すると、別のトリガー（sweepMissedEdits）まで消えてしまうため。
 function setupTrigger() {
   removeTrigger();
   ScriptApp.newTrigger('handleEdit')
@@ -279,14 +295,140 @@ function setupTrigger() {
 
 function setupAutomation() {
   setupTrigger();
+  setupSweeper();
   setupPaymentDropdown();
   setupMonitoringFormula();
   Logger.log('自動処理セットアップ完了');
 }
 
 function removeTrigger() {
+  removeTriggersByHandler_('handleEdit');
+}
+
+function removeTriggersByHandler_(handlerName) {
   ScriptApp.getProjectTriggers().forEach(function(t) {
-    ScriptApp.deleteTrigger(t);
+    if (t.getHandlerFunction() === handlerName) ScriptApp.deleteTrigger(t);
+  });
+}
+
+// ===== 取りこぼし検知（5分おき）=====
+// 編集トリガーは、同時編集・連続編集・一時的な実行失敗などで発火しないことがある。
+// 前回の巡回時点から入金列が新たに OK/NG になった行のうち、通知が未処理のものだけを送信する。
+// 過去から未送信のまま残っている行は対象外（AJ列の警告を見て reprocessUnsent で人が判断する）。
+// 初回は現在の状態を記録するだけで、送信しない。
+var SWEEP_SNAPSHOT_PREFIX = 'PAYMENT_SNAPSHOT_';
+var SWEEP_CHUNK_SIZE = 8000;
+var SWEEP_MAX_SENDS = 10; // 1回の巡回の上限。行の挿入・削除で状態がずれた場合の大量送信を防ぐ
+
+function setupSweeper() {
+  removeTriggersByHandler_('sweepMissedEdits');
+  ScriptApp.newTrigger('sweepMissedEdits')
+    .timeBased()
+    .everyMinutes(5)
+    .create();
+  Logger.log('取りこぼし検知トリガー設定完了');
+}
+
+function removeSweeper() {
+  removeTriggersByHandler_('sweepMissedEdits');
+  clearSweepSnapshot_();
+}
+
+function sweepMissedEdits() {
+  var lock = LockService.getDocumentLock();
+  if (!lock.tryLock(30000)) {
+    console.warn('sweepMissedEdits: ロックを取得できないため次回に回します');
+    return;
+  }
+  try {
+    sweepMissedEdits_();
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function sweepMissedEdits_() {
+  var sheet = SpreadsheetApp.getActive().getSheetByName('シート1');
+  if (!sheet || sheet.getLastRow() < 2) return;
+
+  var headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+  var paymentCol = findColumn_(headers, '入金');
+  if (paymentCol === 0) return;
+
+  var values = sheet.getRange(2, paymentCol, sheet.getLastRow() - 1, 1).getValues();
+  var current = '';
+  for (var i = 0; i < values.length; i++) {
+    var v = normalizePayment_(values[i][0]);
+    current += v === 'OK' ? 'O' : (v === 'NG' ? 'N' : '-');
+  }
+
+  var previous = loadSweepSnapshot_();
+  if (previous === null) {
+    saveSweepSnapshot_(current);
+    console.log('sweepMissedEdits: 初回のため現在の状態を記録しました rows=' + current.length);
+    return;
+  }
+
+  var changed = [];
+  for (var j = 0; j < current.length; j++) {
+    var before = j < previous.length ? previous.charAt(j) : '-';
+    if (current.charAt(j) !== '-' && current.charAt(j) !== before) changed.push(j);
+  }
+
+  if (changed.length > SWEEP_MAX_SENDS) {
+    console.warn('sweepMissedEdits: 変化が ' + changed.length + ' 行あり上限を超えたため送信せず状態だけ更新します（行の挿入・削除の可能性）');
+    saveSweepSnapshot_(current);
+    return;
+  }
+
+  changed.forEach(function(index) {
+    var row = 2 + index;
+    try {
+      if (current.charAt(index) === 'O') {
+        // 状態が空で、エラーも書かれていない行だけ（エラー行や複数行貼り付けの警告行は再送しない）
+        if (getCell_(sheet, row, headers, '発送通知済み') === '' && getCell_(sheet, row, headers, '発送通知エラー') === '') {
+          console.log('sweepMissedEdits: 発送通知を補完 row=' + row);
+          sendShippingNotification_(sheet, row, headers);
+        }
+      } else if (getCell_(sheet, row, headers, 'キャンセル通知済み') === '' && getCell_(sheet, row, headers, 'キャンセル通知エラー') === '') {
+        console.log('sweepMissedEdits: キャンセル通知を補完 row=' + row);
+        sendCancellationNotification_(sheet, row, headers);
+      }
+    } catch (err) {
+      console.error('sweepMissedEdits failed: row=' + row, err);
+    }
+  });
+
+  saveSweepSnapshot_(current);
+}
+
+function loadSweepSnapshot_() {
+  var props = PropertiesService.getScriptProperties();
+  var count = props.getProperty(SWEEP_SNAPSHOT_PREFIX + 'COUNT');
+  if (count === null) return null;
+  var text = '';
+  for (var i = 0; i < Number(count); i++) {
+    text += props.getProperty(SWEEP_SNAPSHOT_PREFIX + i) || '';
+  }
+  return text;
+}
+
+function saveSweepSnapshot_(text) {
+  clearSweepSnapshot_();
+  var props = PropertiesService.getScriptProperties();
+  var data = {};
+  var count = Math.ceil(text.length / SWEEP_CHUNK_SIZE);
+  for (var i = 0; i < count; i++) {
+    data[SWEEP_SNAPSHOT_PREFIX + i] = text.substr(i * SWEEP_CHUNK_SIZE, SWEEP_CHUNK_SIZE);
+  }
+  data[SWEEP_SNAPSHOT_PREFIX + 'COUNT'] = String(count);
+  props.setProperties(data);
+}
+
+function clearSweepSnapshot_() {
+  var props = PropertiesService.getScriptProperties();
+  Object.keys(props.getProperties()).forEach(function(key) {
+    if (key.indexOf(SWEEP_SNAPSHOT_PREFIX) === 0) props.deleteProperty(key);
   });
 }
 

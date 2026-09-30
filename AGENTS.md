@@ -51,10 +51,12 @@ Never run `clasp push` without explicitly selecting and verifying the intended c
 - R列とV〜AA列の自動転記はSpreadsheetのARRAYFORMULAで行い、`setupArrayFormulas()`で設定する。
 - AJ列の処理監視はSpreadsheet関数で行い、`setupMonitoringFormula()`で設定する。監視列自体はメールを送信しない。
 - 未送信の復旧には`reprocessUnsent()`を使用する（入金=OKの発送通知と入金=NGのキャンセル通知の両方が対象）。実行前に対象行と既送信ガードを確認する。
-- `handleEdit`は`LockService`で同時編集を直列化する。
+- `handleEdit`は`LockService`で同時編集を直列化し、入金列が編集範囲に含まれていれば処理する（先頭列ではなく包含で判定）。OK/NGは全角半角・大文字小文字・前後空白を無視して判定する。
+- 編集トリガーの取りこぼしは`sweepMissedEdits()`（5分おき、`setupSweeper()`で設定）が補う。前回巡回から新たにOK/NGになった未処理行だけを送り、過去からの未送信行・エラー行・複数行貼り付けの警告行は送らない。初回は状態の記録のみ。
+- `removeTrigger()`は`handleEdit`のトリガーだけを消す。全トリガーを消す実装にしない（巡回トリガーまで消えるため）。
 
 ## Git And Verification
 
 - Git remote: `https://github.com/kochan17/chikemo.git`
-- Before completion run `node --test tests/chikemoPurchaseForm.test.mjs`, the relevant clasp status command, and `git diff --check`.
+- Before completion run `node --test tests/chikemoPurchaseForm.test.mjs tests/chikemoMain.test.mjs`, the relevant clasp status command, and `git diff --check`.
 - Preserve unrelated work and do not commit `.clasprc.json`, OAuth tokens, cookies, API keys, or customer data.
