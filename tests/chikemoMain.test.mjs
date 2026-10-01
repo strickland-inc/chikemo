@@ -12,7 +12,7 @@ function load({ lastRow = 10 } = {}) {
   const cells = new Map();
   const sent = [];
   const props = new Map();
-  const triggers = [{ fn: 'handleEdit' }, { fn: 'sweepMissedEdits' }, { fn: 'other' }];
+  const triggers = [{ fn: 'handleEdit' }, { fn: 'other' }];
   const deleted = [];
   const headerRow = [];
   headerRow[COL.email - 1] = 'メールアドレス';
@@ -44,6 +44,7 @@ function load({ lastRow = 10 } = {}) {
 
   const context = {
     console: { log() {}, warn() {}, error() {} },
+    Logger: { log() {} },
     SpreadsheetApp: { getActive: () => ({ getSheetByName: (n) => (n === 'シート1' ? sheet : null) }) },
     LockService: { getDocumentLock: () => ({ waitLock() {}, tryLock: () => true, releaseLock() {} }) },
     GmailApp: { sendEmail: (to, subject) => sent.push({ to, subject }) },
@@ -114,41 +115,23 @@ test('removeTrigger は handleEdit のトリガーだけを削除する', () => 
   assert.deepEqual(t.deleted, ['handleEdit']);
 });
 
-test('巡回: 初回は記録のみ、以降は新たに OK/NG になった未処理行だけ送る', () => {
+test('手動送信済みの行は再送しない', () => {
   const t = load();
-  t.setRow(2, { payment: 'NG' }); // 過去からの未送信（対象外）
-  t.setRow(3, {});
-  t.setRow(4, {});
-  t.context.sweepMissedEdits();
-  assert.equal(t.sent.length, 0);
-
-  t.cells.set(`3:${COL.payment}`, 'OK'); // トリガー取りこぼし
-  t.cells.set(`4:${COL.payment}`, 'NG');
-  t.context.sweepMissedEdits();
-  assert.equal(t.sent.length, 2);
-  assert.equal(t.cells.get(`3:${COL.shipStatus}`), '送信済み');
-  assert.equal(t.cells.get(`4:${COL.cancelStatus}`), '送信済み');
-  assert.equal(t.cells.get(`2:${COL.cancelStatus}`), undefined);
-
-  t.context.sweepMissedEdits(); // 再実行しても二重送信しない
-  assert.equal(t.sent.length, 2);
-});
-
-test('巡回: エラー行・複数行警告行は再送しない', () => {
-  const t = load();
-  t.setRow(3, {});
-  t.context.sweepMissedEdits();
-  t.cells.set(`3:${COL.payment}`, 'OK');
-  t.cells.set(`3:${COL.shipError}`, '複数行まとめて OK が入力されました');
-  t.context.sweepMissedEdits();
+  t.setRow(3, { payment: 'OK' });
+  t.setRow(4, { payment: 'NG' });
+  t.cells.set(`3:${COL.shipStatus}`, '手動送信済み');
+  t.cells.set(`4:${COL.cancelStatus}`, '手動送信済み');
+  t.context.handleEdit({ range: t.range(3, COL.payment) });
+  t.context.handleEdit({ range: t.range(4, COL.payment) });
   assert.equal(t.sent.length, 0);
 });
 
-test('巡回: 変化が上限を超えたら送信しない', () => {
-  const t = load({ lastRow: 30 });
-  for (let r = 2; r <= 30; r++) t.setRow(r, {});
-  t.context.sweepMissedEdits();
-  for (let r = 2; r <= 30; r++) t.cells.set(`${r}:${COL.payment}`, 'OK');
-  t.context.sweepMissedEdits();
-  assert.equal(t.sent.length, 0);
+test('reprocessUnsent は手動送信済みを除き、OK/NGの未送信行だけ送る', () => {
+  const t = load();
+  t.setRow(2, { payment: 'OK' });
+  t.setRow(3, { payment: 'NG' });
+  t.setRow(4, { payment: 'NG' });
+  t.cells.set(`3:${COL.cancelStatus}`, '手動送信済み');
+  t.context.reprocessUnsent();
+  assert.deepEqual(t.sent.map((m) => m.to), ['u2@example.com', 'u4@example.com']);
 });

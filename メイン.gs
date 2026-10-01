@@ -79,9 +79,15 @@ function normalizePayment_(value) {
   return String(value).normalize('NFKC').trim().toUpperCase();
 }
 
+// 手動で送った行は、AD列/AG列に「手動送信済み」と入力して処理済みにする。
+// 自動送信済みの「送信済み」と同様に、再送とAJ列の警告の対象外になる。
+function isSentStatus_(status) {
+  return status === '送信済み' || status === '手動送信済み';
+}
+
 // ===== 発送通知メール =====
 function sendShippingNotification_(sheet, row, headers) {
-  if (getCell_(sheet, row, headers, '発送通知済み') === '送信済み') return;
+  if (isSentStatus_(getCell_(sheet, row, headers, '発送通知済み'))) return;
 
   var email = getCell_(sheet, row, headers, 'メールアドレス');
   var tracking = getCell_(sheet, row, headers, '追跡番号');
@@ -123,7 +129,7 @@ function sendShippingNotification_(sheet, row, headers) {
 
 // ===== キャンセル通知メール =====
 function sendCancellationNotification_(sheet, row, headers) {
-  if (getCell_(sheet, row, headers, 'キャンセル通知済み') === '送信済み') return;
+  if (isSentStatus_(getCell_(sheet, row, headers, 'キャンセル通知済み'))) return;
 
   var email = getCell_(sheet, row, headers, 'メールアドレス');
   if (!email) return setError_(sheet, row, headers, 'キャンセル通知', 'メールアドレスが空');
@@ -282,8 +288,7 @@ function getHeaderAliases_(name) {
 }
 
 // ===== トリガー管理 =====
-// 各 remove は対象の関数のトリガーだけを削除する。
-// 全トリガーを削除すると、別のトリガー（sweepMissedEdits）まで消えてしまうため。
+// removeTrigger は handleEdit のトリガーだけを削除する（他のトリガーを巻き込まない）。
 function setupTrigger() {
   removeTrigger();
   ScriptApp.newTrigger('handleEdit')
@@ -295,7 +300,6 @@ function setupTrigger() {
 
 function setupAutomation() {
   setupTrigger();
-  setupSweeper();
   setupPaymentDropdown();
   setupMonitoringFormula();
   Logger.log('自動処理セットアップ完了');
@@ -308,127 +312,6 @@ function removeTrigger() {
 function removeTriggersByHandler_(handlerName) {
   ScriptApp.getProjectTriggers().forEach(function(t) {
     if (t.getHandlerFunction() === handlerName) ScriptApp.deleteTrigger(t);
-  });
-}
-
-// ===== 取りこぼし検知（5分おき）=====
-// 編集トリガーは、同時編集・連続編集・一時的な実行失敗などで発火しないことがある。
-// 前回の巡回時点から入金列が新たに OK/NG になった行のうち、通知が未処理のものだけを送信する。
-// 過去から未送信のまま残っている行は対象外（AJ列の警告を見て reprocessUnsent で人が判断する）。
-// 初回は現在の状態を記録するだけで、送信しない。
-var SWEEP_SNAPSHOT_PREFIX = 'PAYMENT_SNAPSHOT_';
-var SWEEP_CHUNK_SIZE = 8000;
-var SWEEP_MAX_SENDS = 10; // 1回の巡回の上限。行の挿入・削除で状態がずれた場合の大量送信を防ぐ
-
-function setupSweeper() {
-  removeTriggersByHandler_('sweepMissedEdits');
-  ScriptApp.newTrigger('sweepMissedEdits')
-    .timeBased()
-    .everyMinutes(5)
-    .create();
-  Logger.log('取りこぼし検知トリガー設定完了');
-}
-
-function removeSweeper() {
-  removeTriggersByHandler_('sweepMissedEdits');
-  clearSweepSnapshot_();
-}
-
-function sweepMissedEdits() {
-  var lock = LockService.getDocumentLock();
-  if (!lock.tryLock(30000)) {
-    console.warn('sweepMissedEdits: ロックを取得できないため次回に回します');
-    return;
-  }
-  try {
-    sweepMissedEdits_();
-  } finally {
-    lock.releaseLock();
-  }
-}
-
-function sweepMissedEdits_() {
-  var sheet = SpreadsheetApp.getActive().getSheetByName('シート1');
-  if (!sheet || sheet.getLastRow() < 2) return;
-
-  var headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
-  var paymentCol = findColumn_(headers, '入金');
-  if (paymentCol === 0) return;
-
-  var values = sheet.getRange(2, paymentCol, sheet.getLastRow() - 1, 1).getValues();
-  var current = '';
-  for (var i = 0; i < values.length; i++) {
-    var v = normalizePayment_(values[i][0]);
-    current += v === 'OK' ? 'O' : (v === 'NG' ? 'N' : '-');
-  }
-
-  var previous = loadSweepSnapshot_();
-  if (previous === null) {
-    saveSweepSnapshot_(current);
-    console.log('sweepMissedEdits: 初回のため現在の状態を記録しました rows=' + current.length);
-    return;
-  }
-
-  var changed = [];
-  for (var j = 0; j < current.length; j++) {
-    var before = j < previous.length ? previous.charAt(j) : '-';
-    if (current.charAt(j) !== '-' && current.charAt(j) !== before) changed.push(j);
-  }
-
-  if (changed.length > SWEEP_MAX_SENDS) {
-    console.warn('sweepMissedEdits: 変化が ' + changed.length + ' 行あり上限を超えたため送信せず状態だけ更新します（行の挿入・削除の可能性）');
-    saveSweepSnapshot_(current);
-    return;
-  }
-
-  changed.forEach(function(index) {
-    var row = 2 + index;
-    try {
-      if (current.charAt(index) === 'O') {
-        // 状態が空で、エラーも書かれていない行だけ（エラー行や複数行貼り付けの警告行は再送しない）
-        if (getCell_(sheet, row, headers, '発送通知済み') === '' && getCell_(sheet, row, headers, '発送通知エラー') === '') {
-          console.log('sweepMissedEdits: 発送通知を補完 row=' + row);
-          sendShippingNotification_(sheet, row, headers);
-        }
-      } else if (getCell_(sheet, row, headers, 'キャンセル通知済み') === '' && getCell_(sheet, row, headers, 'キャンセル通知エラー') === '') {
-        console.log('sweepMissedEdits: キャンセル通知を補完 row=' + row);
-        sendCancellationNotification_(sheet, row, headers);
-      }
-    } catch (err) {
-      console.error('sweepMissedEdits failed: row=' + row, err);
-    }
-  });
-
-  saveSweepSnapshot_(current);
-}
-
-function loadSweepSnapshot_() {
-  var props = PropertiesService.getScriptProperties();
-  var count = props.getProperty(SWEEP_SNAPSHOT_PREFIX + 'COUNT');
-  if (count === null) return null;
-  var text = '';
-  for (var i = 0; i < Number(count); i++) {
-    text += props.getProperty(SWEEP_SNAPSHOT_PREFIX + i) || '';
-  }
-  return text;
-}
-
-function saveSweepSnapshot_(text) {
-  clearSweepSnapshot_();
-  var props = PropertiesService.getScriptProperties();
-  var data = {};
-  var count = Math.ceil(text.length / SWEEP_CHUNK_SIZE);
-  for (var i = 0; i < count; i++) {
-    data[SWEEP_SNAPSHOT_PREFIX + i] = text.substr(i * SWEEP_CHUNK_SIZE, SWEEP_CHUNK_SIZE);
-  }
-  data[SWEEP_SNAPSHOT_PREFIX + 'COUNT'] = String(count);
-  props.setProperties(data);
-}
-
-function clearSweepSnapshot_() {
-  var props = PropertiesService.getScriptProperties();
-  Object.keys(props.getProperties()).forEach(function(key) {
-    if (key.indexOf(SWEEP_SNAPSHOT_PREFIX) === 0) props.deleteProperty(key);
   });
 }
 
@@ -479,9 +362,9 @@ function setupMonitoringFormula() {
   sheet.getRange('AJ2').setFormula(
     '=ARRAYFORMULA(IF(S2:S="","",' +
       'IF((S2:S="OK")*(AD2:AD="エラー"),"要確認：発送通知エラー",' +
-        'IF((S2:S="OK")*(AD2:AD<>"送信済み"),"要確認：発送通知が未送信です。GASのreprocessUnsent関数を実行してください",' +
+        'IF((S2:S="OK")*(AD2:AD<>"送信済み")*(AD2:AD<>"手動送信済み"),"要確認：発送通知が未送信です。手動で送った場合はAD列に「手動送信済み」と入力してください",' +
           'IF((S2:S="NG")*(AG2:AG="エラー"),"要確認：キャンセル通知エラー",' +
-            'IF((S2:S="NG")*(AG2:AG<>"送信済み"),"要確認：キャンセル通知が未送信です。GASのreprocessUnsent関数を実行してください",""))))))'
+            'IF((S2:S="NG")*(AG2:AG<>"送信済み")*(AG2:AG<>"手動送信済み"),"要確認：キャンセル通知が未送信です。手動で送った場合はAG列に「手動送信済み」と入力してください",""))))))'
   );
 
   Logger.log('処理監視列（AJ列）に ARRAYFORMULA 設定完了');
@@ -514,10 +397,10 @@ function reprocessUnsent() {
 
   for (var i = 0; i < payments.length; i++) {
     var payment = String(payments[i][0]).trim();
-    if (payment === 'OK' && String(shipStatuses[i][0]).trim() !== '送信済み') {
+    if (payment === 'OK' && !isSentStatus_(String(shipStatuses[i][0]).trim())) {
       sendShippingNotification_(sheet, 2 + i, headers);
       shipped++;
-    } else if (payment === 'NG' && String(cancelStatuses[i][0]).trim() !== '送信済み') {
+    } else if (payment === 'NG' && !isSentStatus_(String(cancelStatuses[i][0]).trim())) {
       sendCancellationNotification_(sheet, 2 + i, headers);
       cancelled++;
     }
