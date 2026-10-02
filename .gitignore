@@ -1,4 +1,6 @@
-.claude/
+.claude/*
+!.claude/settings.json
+!.claude/hooks/
 .clasprc.json
 .DS_Store
 node_modules/
