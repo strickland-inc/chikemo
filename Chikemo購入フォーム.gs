@@ -31,7 +31,7 @@ function handleChikemoPurchaseFormEdit(e) {
   if (range.getColumn() !== CHIKEMO_PURCHASE_FORM.columns.payment) return;
 
   var value = String(range.getValue()).trim();
-  var paymentValuesToSend = ['OK', 'OK【トット】', 'OK【モット】'];
+  var paymentValuesToSend = ['OK', 'OK【トット】', 'OK【モット】', 'OK【ツバメ】'];
   if (paymentValuesToSend.indexOf(value) === -1) return; // 「完了」やNGでは送らない
 
   // 複数行貼り付けは先頭行だけ処理し、残りは誤送信防止のため警告する。
